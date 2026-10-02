@@ -1,109 +1,413 @@
-import os, logging
+import os
+import logging
 from urllib.parse import quote_plus
-import aiohttp, aiosqlite
-from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
-TOKEN=os.getenv("TELEGRAM_BOT_TOKEN","")
-PORT=int(os.getenv("PORT","10000"))
-BASE_URL=os.getenv("BASE_URL","").rstrip("/")
-DB=os.getenv("DB_PATH","music.db")
-logging.basicConfig(level=logging.INFO)
-log=logging.getLogger("muzikynk")
+import aiohttp
+import aiosqlite
+from aiohttp import web
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+PORT = int(os.getenv("PORT", "10000"))
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
+DB = os.getenv("DB_PATH", "music.db")
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("muzikynk")
+
+application = None
+
 
 async def init_db():
     async with aiosqlite.connect(DB) as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS searches(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,query TEXT,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS searches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                query TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
         await db.commit()
 
-async def save_search(uid,q):
+
+async def save_search(user_id: int, query: str):
     async with aiosqlite.connect(DB) as db:
-        await db.execute("INSERT INTO searches(user_id,query) VALUES(?,?)",(uid,q))
+        await db.execute(
+            "INSERT INTO searches(user_id, query) VALUES(?, ?)",
+            (user_id, query),
+        )
         await db.commit()
+
 
 def menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔎 Найти музыку",callback_data="search")],
-        [InlineKeyboardButton("🔥 Популярное",callback_data="popular"),InlineKeyboardButton("🕘 История",callback_data="history")],
-        [InlineKeyboardButton("❓ Помощь",callback_data="help")]
-    ])
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔎 Найти музыку", callback_data="search")],
+            [InlineKeyboardButton("🔥 Популярное", callback_data="popular")],
+            [InlineKeyboardButton("🕘 История", callback_data="history")],
+            [InlineKeyboardButton("❓ Помощь", callback_data="help")],
+        ]
+    )
 
-async def search_music(q):
-    headers={"User-Agent":"MuzikYNK/1.0 Telegram bot"}
-    params={"query":q,"fmt":"json","limit":8}
-    async with aiohttp.ClientSession(headers=headers) as s:
-        async with s.get("https://musicbrainz.org/ws/2/recording/",params=params,timeout=15) as r:
-            data=await r.json()
-    out=[]
-    for x in data.get("recordings",[]):
-        artists=", ".join(a.get("name","") for a in x.get("artist-credit",[]) if a.get("name"))
-        rel=x.get("releases",[])
-        out.append({"title":x.get("title","Без названия"),"artist":artists or "Неизвестный исполнитель","album":rel[0].get("title","") if rel else ""})
-    return out
 
-async def start(update,context):
-    await update.message.reply_text("🎵 *MuzikYNK*\n\nНапиши название песни или исполнителя.\nНапример: `The Weeknd Blinding Lights`",parse_mode="Markdown",reply_markup=menu())
+def result_buttons(title: str, artist: str):
+    query = quote_plus(f"{artist} {title}")
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "▶️ YouTube",
+                    url=f"https://www.youtube.com/results?search_query={query}",
+                ),
+                InlineKeyboardButton(
+                    "☁️ SoundCloud",
+                    url=f"https://soundcloud.com/search?q={query}",
+                ),
+            ],
+            [InlineKeyboardButton("🔎 Новый поиск", callback_data="search")],
+        ]
+    )
 
-async def help_cmd(update,context):
-    await update.message.reply_text("❓ Поиск выполняется по каталогу MusicBrainz. Для прослушивания используются официальные источники. Защищённые треки бот не скачивает.",reply_markup=menu())
 
-async def text(update,context):
-    q=update.message.text.strip()
-    if not q or len(q)>150: return
-    await save_search(update.effective_user.id,q)
-    await update.message.reply_text("🔎 Ищу…")
-    try: results=await search_music(q)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🎵 <b>МузыкаYNK</b>\n\n"
+        "Найду информацию о треке по названию или исполнителю.\n\n"
+        "Напиши название песни или исполнителя:",
+        parse_mode="HTML",
+        reply_markup=menu(),
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "❓ <b>Как пользоваться</b>\n\n"
+        "• Напиши исполнителя или название песни.\n"
+        "• Я покажу найденные треки.\n"
+        "• Кнопки ниже откроют официальный поиск YouTube или SoundCloud.\n\n"
+        "Бот не скачивает защищённую авторским правом музыку."
+    )
+
+    if update.callback_query:
+        await update.callback_query.message.reply_text(
+            text, parse_mode="HTML", reply_markup=menu()
+        )
+    elif update.message:
+        await update.message.reply_text(
+            text, parse_mode="HTML", reply_markup=menu()
+        )
+
+
+async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    query = update.message.text.strip()
+    if not query:
+        return
+
+    await save_search(update.effective_user.id, query)
+
+    await update.message.reply_text("🔎 Ищу музыку...")
+
+    url = "https://musicbrainz.org/ws/2/recording/"
+    params = {
+        "query": query,
+        "fmt": "json",
+        "limit": "8",
+    }
+    headers = {"User-Agent": "MuzikYNK/1.0 (Telegram music bot)"}
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, params=params, headers=headers) as resp:
+                if resp.status != 200:
+                    log.error("MusicBrainz HTTP %s", resp.status)
+                    await update.message.reply_text(
+                        "⚠️ Сервис поиска временно недоступен. Попробуй ещё раз."
+                    )
+                    return
+
+                data = await resp.json()
     except Exception:
-        await update.message.reply_text("Не удалось выполнить поиск. Попробуй ещё раз.",reply_markup=menu()); return
-    if not results:
-        await update.message.reply_text("😕 Ничего не найдено.",reply_markup=menu()); return
-    context.user_data["results"]=results
-    buttons=[[InlineKeyboardButton(f"🎵 {x['title']} — {x['artist']}"[:60],callback_data=f"track:{i}")] for i,x in enumerate(results)]
-    await update.message.reply_text(f"🎵 Найдено: {len(results)}\nВыбери трек:",reply_markup=InlineKeyboardMarkup(buttons))
+        log.exception("MusicBrainz request failed")
+        await update.message.reply_text(
+            "⚠️ Не удалось выполнить поиск. Попробуй ещё раз."
+        )
+        return
 
-async def callback(update,context):
-    q=update.callback_query
-    await q.answer()
-    if q.data=="search":
-        await q.message.reply_text("🔎 Напиши название песни или исполнителя:")
-    elif q.data=="help":
-        await help_cmd(update,context)
-    elif q.data=="history":
-        async with aiosqlite.connect(DB) as db:
-            cur=await db.execute("SELECT query FROM searches WHERE user_id=? ORDER BY id DESC LIMIT 10",(q.from_user.id,))
-            rows=await cur.fetchall()
-        await q.message.reply_text("🕘 История:\n\n"+("\n".join("• "+r[0] for r in rows) if rows else "Пусто."),reply_markup=menu())
-    elif q.data=="popular":
-        async with aiosqlite.connect(DB) as db:
-            cur=await db.execute("SELECT query,COUNT(*) c FROM searches GROUP BY query ORDER BY c DESC LIMIT 10")
-            rows=await cur.fetchall()
-        await q.message.reply_text("🔥 Популярное:\n\n"+("\n".join(f"{i+1}. {r[0]}" for i,r in enumerate(rows)) if rows else "Пока пусто."),reply_markup=menu())
-    elif q.data.startswith("track:"):
-        i=int(q.data.split(":")[1]); results=context.user_data.get("results",[])
-        if i>=len(results): return
-        t=results[i]; s=f"{t['artist']} {t['title']}"
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton("🎬 YouTube",url="https://www.youtube.com/results?search_query="+quote_plus(s)),InlineKeyboardButton("☁️ SoundCloud",url="https://soundcloud.com/search?q="+quote_plus(s))],[InlineKeyboardButton("🔎 Новый поиск",callback_data="search")]])
-        await q.message.reply_text(f"🎵 *{t['title']}*\n👤 {t['artist']}\n"+(f"💿 {t['album']}\n" if t["album"] else "")+"\nОфициальные источники:",parse_mode="Markdown",reply_markup=kb)
+    recordings = data.get("recordings", [])
+    if not recordings:
+        await update.message.reply_text(
+            "😔 Ничего не нашёл.\n\n"
+            "Попробуй написать название или исполнителя иначе.",
+            reply_markup=menu(),
+        )
+        return
 
-async def health(request): return web.Response(text="ok")
-async def telegram(request):
-    data=await request.json()
-    await application.process_update(Update.de_json(data,application.bot))
+    for recording in recordings[:8]:
+        title = recording.get("title") or "Без названия"
+        artists = recording.get("artist-credit") or []
+        artist_names = []
+
+        for item in artists:
+            artist = item.get("artist") or {}
+            name = artist.get("name")
+            if name:
+                artist_names.append(name)
+
+        artist = ", ".join(artist_names) or "Неизвестный исполнитель"
+
+        releases = recording.get("releases") or []
+        album = ""
+        if releases:
+            album = releases[0].get("title") or ""
+
+        text = f"🎵 <b>{title}</b>\n👤 {artist}"
+
+        if album:
+            text += f"\n💿 {album}"
+
+        await update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=result_buttons(title, artist),
+        )
+
+
+async def popular(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.callback_query:
+        return
+
+    await update.callback_query.answer()
+
+    async with aiosqlite.connect(DB) as db:
+        cursor = await db.execute(
+            """
+            SELECT query, COUNT(*) AS cnt
+            FROM searches
+            GROUP BY query
+            ORDER BY cnt DESC
+            LIMIT 10
+            """
+        )
+        rows = await cursor.fetchall()
+
+    if not rows:
+        text = "🔥 Пока нет популярного поиска."
+    else:
+        text = "🔥 <b>Популярное</b>\n\n"
+
+        for i, (query, count) in enumerate(rows, 1):
+            text += f"{i}. {query} — {count} раз\n"
+
+    await update.callback_query.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=menu(),
+    )
+
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.callback_query:
+        return
+
+    await update.callback_query.answer()
+
+    async with aiosqlite.connect(DB) as db:
+        cursor = await db.execute(
+            """
+            SELECT query
+            FROM searches
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 10
+            """,
+            (update.effective_user.id,),
+        )
+        rows = await cursor.fetchall()
+
+    if not rows:
+        text = "🕘 История пока пустая."
+    else:
+        text = "🕘 <b>Последние поиски</b>\n\n"
+
+        for i, (query,) in enumerate(rows, 1):
+            text += f"{i}. {query}\n"
+
+    await update.callback_query.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=menu(),
+    )
+
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    await query.answer()
+
+    if query.data == "search":
+        await query.message.reply_text(
+            "🔎 Напиши название песни или исполнителя:"
+        )
+
+    elif query.data == "help":
+        await help_cmd(update, context)
+
+    elif query.data == "popular":
+        await popular(update, context)
+
+    elif query.data == "history":
+        await history(update, context)
+
+
+async def health(request):
     return web.Response(text="ok")
 
-async def post_init(app):
+
+async def telegram_webhook(request):
+    try:
+        data = await request.json()
+
+        update = Update.de_json(
+            data,
+            application.bot,
+        )
+
+        await application.process_update(update)
+
+        return web.Response(text="ok")
+
+    except Exception:
+        log.exception("Webhook update processing failed")
+
+        return web.Response(
+            status=500,
+            text="error",
+        )
+
+
+async def on_startup(app_web: web.Application):
+    global application
+
+    if not TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is not set"
+        )
+
+    if not BASE_URL:
+        raise RuntimeError(
+            "BASE_URL is not set"
+        )
+
     await init_db()
-    if BASE_URL: await app.bot.set_webhook(BASE_URL+"/telegram")
 
-if not TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-application=Application.builder().token(TOKEN).post_init(post_init).build()
-application.add_handler(CommandHandler("start",start))
-application.add_handler(CommandHandler("help",help_cmd))
-application.add_handler(CallbackQueryHandler(callback))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text))
-app=web.Application()
-app.router.add_get("/",health)
-app.router.add_post("/telegram",telegram)
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .build()
+    )
 
-if __name__=="__main__": web.run_app(app,port=PORT)
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CommandHandler("help", help_cmd)
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(callback_handler)
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            search_music,
+        )
+    )
+
+    await application.initialize()
+    await application.start()
+
+    webhook_url = f"{BASE_URL}/telegram"
+
+    await application.bot.set_webhook(
+        webhook_url
+    )
+
+    log.info(
+        "Telegram webhook set to %s",
+        webhook_url,
+    )
+
+    log.info(
+        "MuzikYNK started on port %s",
+        PORT,
+    )
+
+
+async def on_cleanup(app_web: web.Application):
+    global application
+
+    if application is not None:
+
+        try:
+            await application.bot.delete_webhook()
+
+        except Exception:
+            log.exception(
+                "Could not delete webhook"
+            )
+
+        await application.stop()
+        await application.shutdown()
+
+
+def create_app():
+    app_web = web.Application()
+
+    app_web.router.add_get(
+        "/",
+        health,
+    )
+
+    app_web.router.add_post(
+        "/telegram",
+        telegram_webhook,
+    )
+
+    app_web.on_startup.append(
+        on_startup
+    )
+
+    app_web.on_cleanup.append(
+        on_cleanup
+    )
+
+    return app_web
+
+
+if __name__ == "__main__":
+    web.run_app(
+        create_app(),
+        host="0.0.0.0",
+        port=PORT,
+    )
